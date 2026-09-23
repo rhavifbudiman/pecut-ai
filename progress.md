@@ -94,3 +94,16 @@ Note: during testing the hooks were installed into a **temporary** settings file
 - Auto-start at login (Windows Startup folder / macOS LaunchAgent / Linux autostart).
 - Standalone .exe / .app build with PyInstaller.
 - Detecting other AI apps (ChatGPT, Cursor) by process.
+
+---
+
+## 2026-09-23 - Published as open source on GitHub
+
+**Asked:** create a GitHub repo for this project on the personal account, public, open source.
+
+**Done:**
+- Checked every file for secrets or personal paths first. Nothing sensitive was found.
+- Added `README.md` (install and usage guide) and `LICENSE` (MIT).
+- Created the public repo https://github.com/rhavifbudiman/pecut-ai with branch `main`, 1 commit, 28 files.
+  Topics: claude-code, ai, fun, pyside6, desktop-app, indonesia.
+- Not uploaded (because of `.gitignore`): `__pycache__/` and `tools/previews/`.
