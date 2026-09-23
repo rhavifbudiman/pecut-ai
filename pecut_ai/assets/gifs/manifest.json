@@ -1,0 +1,71 @@
+{
+  "order": [
+    "pixel",
+    "doodle",
+    "cartoon",
+    "neon",
+    "comic"
+  ],
+  "styles": {
+    "pixel": {
+      "file": "pixel.gif",
+      "name_id": "Pixel Art 8-bit",
+      "name_en": "8-bit Pixel Art",
+      "crack_frames": [
+        12
+      ],
+      "frame_count": 24,
+      "width": 360,
+      "height": 270,
+      "pixelated": true
+    },
+    "doodle": {
+      "file": "doodle.gif",
+      "name_id": "Coretan Buku Tulis",
+      "name_en": "Notebook Doodle",
+      "crack_frames": [
+        12
+      ],
+      "frame_count": 24,
+      "width": 360,
+      "height": 270,
+      "pixelated": false
+    },
+    "cartoon": {
+      "file": "cartoon.gif",
+      "name_id": "Kartun Flat",
+      "name_en": "Flat Cartoon",
+      "crack_frames": [
+        12
+      ],
+      "frame_count": 24,
+      "width": 360,
+      "height": 270,
+      "pixelated": false
+    },
+    "neon": {
+      "file": "neon.gif",
+      "name_id": "Neon Synthwave",
+      "name_en": "Neon Synthwave",
+      "crack_frames": [
+        12
+      ],
+      "frame_count": 24,
+      "width": 360,
+      "height": 270,
+      "pixelated": false
+    },
+    "comic": {
+      "file": "comic.gif",
+      "name_id": "Komik Manga",
+      "name_en": "Manga Comic",
+      "crack_frames": [
+        12
+      ],
+      "frame_count": 24,
+      "width": 360,
+      "height": 270,
+      "pixelated": false
+    }
+  }
+}

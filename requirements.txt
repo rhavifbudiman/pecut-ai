@@ -1,0 +1,2 @@
+PySide6>=6.5
+Pillow>=10.1  # only needed to regenerate the GIFs (tools/generate_gifs.py)
