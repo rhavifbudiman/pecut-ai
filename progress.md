@@ -107,3 +107,47 @@ Note: during testing the hooks were installed into a **temporary** settings file
 - Created the public repo https://github.com/rhavifbudiman/pecut-ai with branch `main`, 1 commit, 28 files.
   Topics: claude-code, ai, fun, pyside6, desktop-app, indonesia.
 - Not uploaded (because of `.gitignore`): `__pycache__/` and `tools/previews/`.
+
+---
+
+## 2026-09-23 - Made the app much lighter on CPU
+
+**Asked:** the animation sometimes made the laptop lag. Make it use as little CPU/RAM as possible
+and stay portable. Is C or C++ needed?
+
+**Answer:** C/C++ is not needed. The drawing itself already runs inside Qt, which is C++. The slow
+part was *how much work we asked Qt to do per frame*, not the language.
+
+**Before vs after** (measured with psutil over 20 seconds, share of one CPU core):
+
+| State | Before | After |
+|---|---|---|
+| Idle | 0.1% | 0.0% |
+| Whipping, sound on | 20.3% | 2.0 - 4.8% (3 runs) |
+| Whipping, sound off | - | 1.4% |
+| Battery saver (12 fps) | - | 1.6 - 2.1% |
+| RAM while whipping | 78 MB | 72 MB |
+
+**What was slow and what changed (plain explanation):**
+1. The window was redrawn about 58 times per second (a 30 ms timer *plus* every GIF frame). Now
+   one timer follows the GIF's own speed: 25 times per second, and only the GIF area is redrawn.
+2. Every redraw rebuilt everything from scratch: resized the GIF picture, cut the rounded corners,
+   drew the border, built the speech-bubble shape and wrapped its text. *Example:* in 1 minute
+   the same bubble was built about 3,500 times. Now each frame is prepared once when the style
+   loads (24 frames) and the bubble only when its text changes (about every 3.5 seconds).
+3. Sound used QtMultimedia, which keeps extra audio threads alive. Now it uses the OS's built-in
+   player (`winsound` on Windows, `afplay` on macOS, `pw-play`/`paplay`/`aplay` on Linux). The
+   volume is applied by saving a quieter copy of the WAV once in `~/.pecut_ai/cache/sounds/`.
+4. Checking for Claude sessions went from every 0.4 s to a folder watcher (reacts instantly), plus
+   a safety check every 3 s. The tray tooltip is only updated when its text changes.
+5. New menu option **Battery saver**: plays every other frame (12 fps), off by default.
+6. `requirements.txt` now uses `PySide6-Essentials` (smaller install, no multimedia module).
+
+**Files:** `pecut_ai/overlay.py` (rewritten rendering), `pecut_ai/sound.py` (new, portable sound),
+`pecut_ai/app.py` (watcher, tooltip, menu toggle), `pecut_ai/settings.py` + `pecut_ai/phrases.py`
+(`eco_mode` setting and its menu text), `README.md`, `requirements.txt`.
+
+**Verified:** benchmark above; screenshots look the same as before (bubble, CTAR!, counter,
+border, sharp on a 125% display); a real hook `start` -> `stop` run showed the window within
+0.4 s, counted lashes and hid after the linger time; a second copy of the app is still refused
+("Pecut AI is already running.").

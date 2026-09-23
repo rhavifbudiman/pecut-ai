@@ -1,26 +1,48 @@
-"""Floating always-on-top overlay that plays the whipping GIF."""
+"""Floating always-on-top overlay that plays the whipping animation.
+
+Performance notes (why this file looks the way it does):
+- Every GIF frame is decoded, scaled and framed (rounded card + border) ONCE when
+  a style is loaded. Playing a frame is then a single pixmap copy.
+- The speech bubble, counter badge and CTAR! text are also rendered once into
+  pixmaps and only re-rendered when their text or the size changes.
+- One timer drives the animation at the GIF's own frame rate and only the GIF
+  area is repainted per frame. Nothing ticks while the window is hidden.
+"""
 import random
 import time
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QMovie, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QGuiApplication, QImage, QImageReader, QPainter, QPainterPath,
+                           QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import QWidget
 
 from . import phrases
-from .settings import GIF_DIR, SOUND_DIR
-
-try:
-    from PySide6.QtMultimedia import QSoundEffect
-except Exception:
-    QSoundEffect = None
+from .settings import GIF_DIR
+from .sound import SoundPlayer
 
 MARGIN = 6
 BUBBLE_BASE_H = 66
 BUBBLE_TAIL = 12
 ONO_MS = 480
+ONO_POP = 1.35
 SHAKE_MS = 110
-ANIM_TICK_MS = 30
+SHAKE_PAD = 6
+CARD_RADIUS = 14
+CARD_BORDER = 3
+CARD_PAD = 2
+DEFAULT_FRAME_MS = 40
+MIN_FRAME_MS = 10
+ECO_FRAME_STEP = 2
 SCREEN_MARGIN = 24
+INK = QColor(30, 20, 15)
+
+
+def new_canvas(w, h, dpr):
+    """Transparent HiDPI-aware image to paint into."""
+    img = QImage(max(1, round(w * dpr)), max(1, round(h * dpr)), QImage.Format_ARGB32_Premultiplied)
+    img.setDevicePixelRatio(dpr)
+    img.fill(Qt.transparent)
+    return img
 
 
 class Overlay(QWidget):
@@ -36,24 +58,31 @@ class Overlay(QWidget):
         self.settings = settings
         self.stats = stats
         self.manifest = manifest
-        self.movie = None
         self.style_id = None
         self.style_meta = {}
+        self.frames = []
+        self.frames_size = None
+        self.delays = []
+        self.frame_index = 0
         self.working = False
         self.bubble_text = ""
+        self.bubble_pix = None
+        self.counter_key = None
+        self.counter_pix = None
         self.ono_text = ""
+        self.ono_pix = None
         self.ono_t0 = 0.0
         self.shake_t0 = 0.0
         self.drag_offset = None
         self.drag_moved = False
-        self.sounds = self.load_sounds()
+        self.sound = SoundPlayer()
         self.apply_window_flags()
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
         self.bubble_timer = QTimer(self, timeout=self.next_nag)
         self.linger_timer = QTimer(self, singleShot=True, timeout=self.finish_linger)
-        self.anim_timer = QTimer(self, interval=ANIM_TICK_MS, timeout=self.update)
+        self.frame_timer = QTimer(self, singleShot=True, timeout=self.next_frame)
         self.setWindowOpacity(float(self.settings["opacity"]))
         self.relayout()
 
@@ -69,28 +98,25 @@ class Overlay(QWidget):
         if visible:
             self.show()
 
-    def load_sounds(self):
-        """Load all crack WAV variants (empty list if audio is unavailable)."""
-        if QSoundEffect is None:
-            return []
-        out = []
-        for path in sorted(SOUND_DIR.glob("crack_*.wav")):
-            eff = QSoundEffect(self)
-            eff.setSource(QUrl.fromLocalFile(str(path)))
-            out.append(eff)
-        return out
+    def dpr(self):
+        """Device pixel ratio of the screen the window is on."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        return screen.devicePixelRatio() if screen else 1.0
+
+    def scale(self):
+        """User size factor."""
+        return float(self.settings["scale"])
 
     def gif_size(self):
         """Scaled GIF size in pixels."""
         meta = self.style_meta or next(iter(self.manifest["styles"].values()), {"width": 360, "height": 270})
-        scale = float(self.settings["scale"])
-        return int(meta["width"] * scale), int(meta["height"] * scale)
+        return int(meta["width"] * self.scale()), int(meta["height"] * self.scale())
 
     def bubble_h(self):
         """Height reserved for the speech bubble."""
         if not self.settings["show_bubble"]:
             return 0
-        return int(BUBBLE_BASE_H * max(0.75, float(self.settings["scale"])))
+        return int(BUBBLE_BASE_H * max(0.75, self.scale()))
 
     def gif_rect(self):
         """Where the GIF is painted inside the window."""
@@ -98,9 +124,14 @@ class Overlay(QWidget):
         return QRect(MARGIN, MARGIN + self.bubble_h(), gw, gh)
 
     def relayout(self):
-        """Resize the window after a size/bubble change, keeping it on screen."""
+        """Resize after a size/bubble change, re-render caches, keep on screen."""
         gw, gh = self.gif_size()
         self.setFixedSize(gw + 2 * MARGIN, gh + self.bubble_h() + 2 * MARGIN)
+        if self.style_id is not None and self.frames and self.frames_size != (gw, gh, self.dpr()):
+            self.bake_frames()
+        self.bubble_pix = None
+        self.counter_key = None
+        self.ono_pix = None
         self.place()
         self.update()
 
@@ -132,26 +163,50 @@ class Overlay(QWidget):
         return random.choice(choices)
 
     def load_style(self, style_id):
-        """Swap the playing GIF to the given style."""
-        if self.movie is not None:
-            self.movie.stop()
-            self.movie.deleteLater()
+        """Swap the playing animation to the given style."""
         self.style_id = style_id
         self.style_meta = self.manifest["styles"][style_id]
-        self.movie = QMovie(str(GIF_DIR / self.style_meta["file"]), parent=self)
-        self.movie.setCacheMode(QMovie.CacheAll)
-        self.movie.setSpeed(int(100 * float(self.settings["speed"])))
-        self.movie.frameChanged.connect(self.on_frame)
+        self.frames = []
+        self.frames_size = None
+        self.frame_index = 0
         self.relayout()
-        if self.working:
-            self.movie.start()
-        else:
-            self.movie.jumpToFrame(0)
+        self.bake_frames()
+        self.update()
 
-    def set_speed(self, speed):
-        """Apply a new playback speed."""
-        if self.movie is not None:
-            self.movie.setSpeed(int(100 * speed))
+    def bake_frames(self):
+        """Decode the GIF once and pre-render every frame as a finished card."""
+        gw, gh = self.gif_size()
+        dpr = self.dpr()
+        reader = QImageReader(str(GIF_DIR / self.style_meta["file"]))
+        mode = Qt.FastTransformation if self.style_meta.get("pixelated") else Qt.SmoothTransformation
+        target = QSize(round(gw * dpr), round(gh * dpr))
+        card = QPainterPath()
+        card.addRoundedRect(QRectF(CARD_PAD, CARD_PAD, gw, gh), CARD_RADIUS, CARD_RADIUS)
+        frames, delays = [], []
+        while True:
+            img = reader.read()
+            if img.isNull():
+                break
+            delays.append(reader.nextImageDelay() or DEFAULT_FRAME_MS)
+            src = img.scaled(target, Qt.IgnoreAspectRatio, mode)
+            src.setDevicePixelRatio(dpr)
+            out = new_canvas(gw + 2 * CARD_PAD, gh + 2 * CARD_PAD, dpr)
+            p = QPainter(out)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            p.setClipPath(card)
+            p.drawImage(QPointF(CARD_PAD, CARD_PAD), src)
+            p.setClipping(False)
+            p.setPen(QPen(INK, CARD_BORDER))
+            p.drawPath(card)
+            p.end()
+            frames.append(QPixmap.fromImage(out))
+        self.frames = frames
+        self.delays = delays or [DEFAULT_FRAME_MS]
+        self.frames_size = (gw, gh, dpr)
+        self.frame_index = min(self.frame_index, max(0, len(frames) - 1))
+
+    def set_speed(self, _speed):
+        """Speed is read on every frame tick, nothing to do here."""
 
     # ------------------------------------------------------------ state
 
@@ -159,16 +214,16 @@ class Overlay(QWidget):
         """AI started working: show up and start whipping."""
         self.linger_timer.stop()
         self.working = True
-        if self.movie is None or self.settings["style"] == "random":
+        if not self.frames or self.settings["style"] == "random":
             self.load_style(self.choose_style())
         elif self.style_id != self.settings["style"]:
             self.load_style(self.settings["style"])
-        self.bubble_text = phrases.pick(phrases.START, self.settings["language"])
+        self.set_bubble(phrases.pick(phrases.START, self.settings["language"]))
         self.bubble_timer.start(int(float(self.settings["bubble_interval_sec"]) * 1000))
-        self.movie.start()
-        self.anim_timer.start()
+        self.frame_index = 0
         self.show()
         self.raise_()
+        self.schedule_frame()
 
     def stop_working(self):
         """AI finished: say something nice-ish, then disappear."""
@@ -176,82 +231,73 @@ class Overlay(QWidget):
             return
         self.working = False
         self.bubble_timer.stop()
-        if self.movie is not None:
-            self.movie.setPaused(True)
-        self.bubble_text = phrases.pick(phrases.DONE, self.settings["language"])
-        self.update()
+        self.frame_timer.stop()
+        self.ono_text = ""
+        self.set_bubble(phrases.pick(phrases.DONE, self.settings["language"]))
         self.linger_timer.start(int(float(self.settings["linger_sec"]) * 1000))
 
     def finish_linger(self):
         """Hide after the linger period."""
         if not self.working:
-            if self.movie is not None:
-                self.movie.stop()
-            self.anim_timer.stop()
+            self.frame_timer.stop()
             self.hide()
+
+    def set_bubble(self, text):
+        """Change the speech bubble text (re-rendered lazily)."""
+        self.bubble_text = text
+        self.bubble_pix = None
+        self.update()
 
     def next_nag(self):
         """Rotate the nagging speech bubble."""
-        self.bubble_text = phrases.pick(phrases.NAG, self.settings["language"], avoid=self.bubble_text)
-        self.update()
+        self.set_bubble(phrases.pick(phrases.NAG, self.settings["language"], avoid=self.bubble_text))
 
-    def on_frame(self, index):
-        """Repaint every frame; fire the lash effects on crack frames."""
-        if self.working and index in self.style_meta.get("crack_frames", []):
-            self.lash()
-        self.update()
+    def frame_step(self):
+        """How many GIF frames to advance per tick (eco mode skips every other one)."""
+        return ECO_FRAME_STEP if self.settings["eco_mode"] else 1
+
+    def schedule_frame(self):
+        """Arm the timer for the current frame's duration at the chosen speed."""
+        if not self.working or not self.frames:
+            return
+        step = self.frame_step()
+        ms = sum(self.delays[(self.frame_index + k) % len(self.delays)] for k in range(step))
+        self.frame_timer.start(max(MIN_FRAME_MS, int(ms / max(0.1, float(self.settings["speed"])))))
+
+    def next_frame(self):
+        """Advance the animation, fire lash effects on crack frames, repaint the GIF area."""
+        if not self.working or not self.frames:
+            return
+        n = len(self.frames)
+        cracks = self.style_meta.get("crack_frames", [])
+        for _ in range(self.frame_step()):
+            self.frame_index = (self.frame_index + 1) % n
+            if self.frame_index in cracks:
+                self.lash()
+        self.update(self.gif_rect().adjusted(-SHAKE_PAD, -SHAKE_PAD, SHAKE_PAD, SHAKE_PAD))
+        self.schedule_frame()
 
     def lash(self):
         """One whip hit: counter, sound, onomatopoeia, shake."""
         self.stats.add_lash()
         self.lashed.emit()
         now = time.monotonic()
-        self.ono_text = phrases.pick(phrases.ONO, self.settings["language"])
+        text = phrases.pick(phrases.ONO, self.settings["language"])
+        if text != self.ono_text:
+            self.ono_text = text
+            self.ono_pix = None
         self.ono_t0 = now
         self.shake_t0 = now
-        if self.settings["sound"] and self.sounds:
-            eff = random.choice(self.sounds)
-            eff.setVolume(float(self.settings["volume"]))
-            eff.play()
+        if self.settings["sound"]:
+            self.sound.play(self.settings["volume"])
 
-    # ------------------------------------------------------------ painting
+    # ------------------------------------------------------------ cached layers
 
-    def paintEvent(self, event):
-        """Draw bubble, GIF card, counter badge and onomatopoeia."""
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        now = time.monotonic()
-        gr = self.gif_rect()
-        if (now - self.shake_t0) * 1000 < SHAKE_MS:
-            gr.translate(random.randint(-3, 3), random.randint(-2, 2))
-        self.paint_gif(p, gr)
-        if self.settings["show_bubble"] and self.bubble_text:
-            self.paint_bubble(p)
-        if self.settings["show_counter"]:
-            self.paint_counter(p, gr)
-        if self.settings["show_ono"] and self.ono_text and (now - self.ono_t0) * 1000 < ONO_MS:
-            self.paint_ono(p, gr, (now - self.ono_t0) * 1000 / ONO_MS)
-        p.end()
-
-    def paint_gif(self, p, gr):
-        """GIF inside a rounded card with a thick border."""
-        radius = 14
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(gr), radius, radius)
-        p.save()
-        p.setClipPath(path)
-        if self.movie is not None:
-            pix = self.movie.currentPixmap()
-            p.setRenderHint(QPainter.SmoothPixmapTransform, not self.style_meta.get("pixelated", False))
-            p.drawPixmap(gr, pix)
-        p.restore()
-        p.setPen(QPen(QColor(30, 20, 15), 3))
-        p.drawPath(path)
-
-    def paint_bubble(self, p):
-        """White speech bubble with a tail pointing at the foreman."""
+    def render_bubble(self):
+        """Speech bubble with a tail pointing at the foreman, as a pixmap."""
         gw, _ = self.gif_size()
         bh = self.bubble_h() - BUBBLE_TAIL
+        img = new_canvas(gw + 2 * MARGIN, self.bubble_h() + MARGIN, self.dpr())
         rect = QRectF(MARGIN + 2, MARGIN + 2, gw - 4, bh - 4)
         path = QPainterPath()
         path.addRoundedRect(rect, 14, 14)
@@ -261,50 +307,104 @@ class Overlay(QWidget):
         tail_path = QPainterPath()
         tail_path.addPolygon(tail)
         path = path.united(tail_path)
-        p.setPen(QPen(QColor(30, 20, 15), 2.5))
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(INK, 2.5))
         p.setBrush(QColor(255, 255, 255, 245))
         p.drawPath(path)
         font = QFont("Arial", 1, QFont.Black)
-        font.setPixelSize(int(15 * max(0.8, float(self.settings["scale"]))))
+        font.setPixelSize(int(15 * max(0.8, self.scale())))
         p.setFont(font)
         p.setPen(QColor(25, 20, 20))
         p.drawText(rect.adjusted(10, 4, -10, -4), Qt.AlignCenter | Qt.TextWordWrap, self.bubble_text)
+        p.end()
+        return QPixmap.fromImage(img)
 
-    def paint_counter(self, p, gr):
-        """Pill badge with the lash counter."""
-        text = phrases.ui_text(self.settings["language"], "counter_label", n=self.stats.data["today"])
+    def render_counter(self, text):
+        """Pill badge with the lash counter, as a pixmap."""
         font = QFont("Arial", 1, QFont.Bold)
-        font.setPixelSize(int(12 * max(0.8, float(self.settings["scale"]))))
+        font.setPixelSize(int(12 * max(0.8, self.scale())))
+        metrics = QFontMetrics(font)
+        tw = metrics.horizontalAdvance(text) + 16
+        th = metrics.height() + 6
+        img = new_canvas(tw, th, self.dpr())
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
         p.setFont(font)
-        tw = p.fontMetrics().horizontalAdvance(text) + 16
-        th = p.fontMetrics().height() + 6
-        badge = QRectF(gr.right() - tw - 8, gr.bottom() - th - 8, tw, th)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor(20, 15, 10, 200))
-        p.drawRoundedRect(badge, th / 2, th / 2)
+        p.drawRoundedRect(QRectF(0, 0, tw, th), th / 2, th / 2)
         p.setPen(QColor(255, 220, 80))
-        p.drawText(badge, Qt.AlignCenter, text)
+        p.drawText(QRectF(0, 0, tw, th), Qt.AlignCenter, text)
+        p.end()
+        return QPixmap.fromImage(img)
 
-    def paint_ono(self, p, gr, t):
-        """Popping, fading CTAR! text near the robot."""
-        pop = 1.35 - 0.35 * min(1.0, t * 3)
-        alpha = int(255 * (1.0 - max(0.0, t - 0.55) / 0.45))
+    def render_ono(self, gr):
+        """CTAR! text at its biggest pop size, tilted, as a pixmap."""
         font = QFont("Impact", 1, QFont.Black)
-        font.setPixelSize(int(gr.height() * 0.17 * pop))
+        font.setPixelSize(int(gr.height() * 0.17 * ONO_POP))
         path = QPainterPath()
         path.addText(0, 0, font, self.ono_text)
-        box = path.boundingRect()
-        cx = gr.left() + gr.width() * 0.62
-        cy = gr.top() + gr.height() * 0.2
-        path.translate(cx - box.width() / 2 - box.left(), cy - box.height() / 2 - box.top())
-        p.save()
-        p.translate(cx, cy)
+        stroke = max(3, gr.height() // 45)
+        box = path.boundingRect().adjusted(-stroke, -stroke, stroke, stroke)
+        side = int((box.width() ** 2 + box.height() ** 2) ** 0.5) + 2
+        img = new_canvas(side, side, self.dpr())
+        p = QPainter(img)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.translate(side / 2, side / 2)
         p.rotate(-8)
-        p.translate(-cx, -cy)
-        p.setPen(QPen(QColor(20, 10, 5, alpha), max(3, gr.height() // 45), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.translate(-box.center())
+        p.setPen(QPen(QColor(20, 10, 5), stroke, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         p.setBrush(Qt.NoBrush)
         p.drawPath(path)
-        p.fillPath(path, QColor(255, 225, 40, alpha))
+        p.fillPath(path, QColor(255, 225, 40))
+        p.end()
+        return QPixmap.fromImage(img)
+
+    # ------------------------------------------------------------ painting
+
+    def paintEvent(self, event):
+        """Blit the cached layers: bubble, GIF card, counter, CTAR!."""
+        p = QPainter(self)
+        now = time.monotonic()
+        gr = self.gif_rect()
+        if self.working and (now - self.shake_t0) * 1000 < SHAKE_MS:
+            gr.translate(random.randint(-3, 3), random.randint(-2, 2))
+        if self.frames:
+            p.drawPixmap(gr.left() - CARD_PAD, gr.top() - CARD_PAD, self.frames[self.frame_index])
+        if self.settings["show_bubble"] and self.bubble_text:
+            if self.bubble_pix is None:
+                self.bubble_pix = self.render_bubble()
+            p.drawPixmap(0, 0, self.bubble_pix)
+        if self.settings["show_counter"]:
+            self.paint_counter(p, gr)
+        age_ms = (now - self.ono_t0) * 1000
+        if self.working and self.settings["show_ono"] and self.ono_text and age_ms < ONO_MS:
+            self.paint_ono(p, gr, age_ms / ONO_MS)
+        p.end()
+
+    def paint_counter(self, p, gr):
+        """Counter badge in the bottom-right of the GIF card."""
+        text = phrases.ui_text(self.settings["language"], "counter_label", n=self.stats.data["today"])
+        if text != self.counter_key:
+            self.counter_key = text
+            self.counter_pix = self.render_counter(text)
+        size = self.counter_pix.deviceIndependentSize()
+        p.drawPixmap(QPointF(gr.right() - size.width() - 8, gr.bottom() - size.height() - 8), self.counter_pix)
+
+    def paint_ono(self, p, gr, t):
+        """Popping, fading CTAR! near the robot (scaled + faded cached pixmap)."""
+        if self.ono_pix is None:
+            self.ono_pix = self.render_ono(gr)
+        pop = (ONO_POP - 0.35 * min(1.0, t * 3)) / ONO_POP
+        size = self.ono_pix.deviceIndependentSize()
+        w, h = size.width() * pop, size.height() * pop
+        cx = gr.left() + gr.width() * 0.62
+        cy = gr.top() + gr.height() * 0.2
+        p.save()
+        p.setOpacity(1.0 - max(0.0, t - 0.55) / 0.45)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.drawPixmap(QRectF(cx - w / 2, cy - h / 2, w, h), self.ono_pix, QRectF(self.ono_pix.rect()))
         p.restore()
 
     # ------------------------------------------------------------ mouse
@@ -335,3 +435,4 @@ class Overlay(QWidget):
         order = self.manifest.get("order", [])
         if order and self.style_id in order:
             self.load_style(order[(order.index(self.style_id) + 1) % len(order)])
+            self.schedule_frame()

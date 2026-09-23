@@ -47,6 +47,24 @@ reset position / counter, and install / remove hooks. Double click the animation
 
 Settings are stored in `~/.pecut_ai/settings.json`.
 
+## Performance
+
+Pecut AI is built to stay out of your way:
+
+- Every animation frame is pre-rendered once, so playing a frame is a single image copy.
+- Only the animation area is repainted, and nothing runs while the window is hidden.
+- Sound uses the OS player (winsound / afplay / pw-play, paplay, aplay) instead of a media framework.
+- Session changes are picked up by a folder watcher instead of fast polling.
+
+Measured on Windows 11 (Python 3.11, PySide6 6.11), share of one CPU core:
+
+| State | Before | Now |
+|---|---|---|
+| Idle (no AI running) | 0.1% | 0.0% |
+| Whipping | 20.3% | about 2-5% |
+
+"Battery saver" in the menu halves the frame rate (12 fps) if you want it even lighter.
+
 ## Regenerating the assets
 
 ```bash

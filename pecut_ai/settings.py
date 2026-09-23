@@ -23,6 +23,7 @@ DEFAULTS = {
     "show_counter": True,
     "show_ono": True,
     "always_on_top": True,
+    "eco_mode": False,
     "scale": 0.75,
     "speed": 1.0,
     "opacity": 1.0,

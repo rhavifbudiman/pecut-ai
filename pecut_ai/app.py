@@ -4,16 +4,16 @@ import sys
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QTimer
+from PySide6.QtCore import QFileSystemWatcher, QLockFile, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from . import installer, phrases
-from .hook import STATE_DIR
+from .hook import SESSIONS_DIR, STATE_DIR
 from .overlay import Overlay
 from .settings import ICON_PATH, Settings, Stats, active_sessions, clear_sessions, load_manifest
 
-POLL_MS = 400
+POLL_MS = 3000
 STATS_FLUSH_MS = 5000
 SNAPSHOT_MS = 350
 SNAPSHOT_MAX = 40
@@ -34,6 +34,7 @@ class PecutApp:
         self.manifest = load_manifest()
         self.demo = demo
         self.sessions = 0
+        self.tooltip = None
         self.overlay = Overlay(self.settings, self.stats, self.manifest)
         self.overlay.menu_requested.connect(self.popup_menu)
         self.overlay.moved.connect(lambda x, y: self.settings.set("position", [x, y]))
@@ -47,6 +48,9 @@ class PecutApp:
             self.tray.setContextMenu(self.menu)
             self.tray.show()
         self.build_menu()
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        self.watcher = QFileSystemWatcher([str(SESSIONS_DIR)])
+        self.watcher.directoryChanged.connect(self.poll)
         self.poll_timer = QTimer(timeout=self.poll)
         self.poll_timer.start(POLL_MS)
         self.flush_timer = QTimer(timeout=self.stats.flush)
@@ -69,8 +73,10 @@ class PecutApp:
             self.overlay.start_working()
         elif not busy and self.overlay.working:
             self.overlay.stop_working()
-        if self.tray is not None:
-            self.tray.setToolTip("Pecut AI - " + self.status_text())
+        tooltip = "Pecut AI - " + self.status_text()
+        if self.tray is not None and tooltip != self.tooltip:
+            self.tooltip = tooltip
+            self.tray.setToolTip(tooltip)
 
     def status_text(self):
         """Short status line for tooltip and menu header."""
@@ -163,6 +169,7 @@ class PecutApp:
         self.add_toggle("show_counter", self.t("counter"))
         self.add_toggle("show_ono", self.t("ono"))
         self.add_toggle("always_on_top", self.t("on_top"), lambda _v: self.overlay.apply_window_flags())
+        self.add_toggle("eco_mode", self.t("eco"))
         m.addSeparator()
         self.add_action(self.t("reset_pos"), self.reset_position)
         self.add_action(self.t("reset_count"), self.reset_counter)
